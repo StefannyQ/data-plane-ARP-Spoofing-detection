@@ -2,7 +2,7 @@
 
 Code for the ARP-spoofing-detection / data plane-deployability pipeline used
 in the paper: data cleaning → EDA → train-only feature engineering and
-model training under SmartNIC hardware constraints (S1-S4 scenarios) →
+model training under data-plane hardware constraints (S1-S4 scenarios) →
 integer quantization → P4/BMv2 hardware-fidelity validation.
 
 No data or trained models are included here -- only the code. The dataset
