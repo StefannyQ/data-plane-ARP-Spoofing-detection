@@ -323,7 +323,7 @@ def reduce_correlated_redundancy(X_train_sub, y_train, threshold=CORRELATION_THR
 
 
 def reduce_feature_set(candidate_cols, X_train_full, y_train, label,
-                        exclude_from_correlation=None):
+                        exclude_from_correlation=None, random_state=RANDOM_STATE):
     """Applies, in order: near-constant removal, correlation-redundancy
     removal, near-zero-MI removal -- all computed from X_train_full
     restricted to candidate_cols (i.e. train-only rows). Redundancy is
@@ -349,7 +349,8 @@ def reduce_feature_set(candidate_cols, X_train_full, y_train, label,
     for entry in redundancy_log:
         print(f"    {entry['pair']} (r={entry['r']}) -> keep {entry['keep']!r}, drop {entry['drop']!r}")
 
-    near_zero_mi, mi_scores = find_near_zero_mi(X_train_full[remaining], y_train)
+    near_zero_mi, mi_scores = find_near_zero_mi(X_train_full[remaining], y_train,
+                                                random_state=random_state)
     print(f"  Near-zero MI with label (on survivors): {near_zero_mi}")
     remaining = [c for c in remaining if c not in near_zero_mi]
 
@@ -417,12 +418,13 @@ def make_ablation_sample(X_train_full, y_train, sample_size=ABLATION_SAMPLE_SIZE
     return X_train_full.loc[idx], y_train.loc[idx]
 
 
-def ablate_rate_iat(feature_list, X_train_full, y_train, X_val_full, y_val, label):
+def ablate_rate_iat(feature_list, X_train_full, y_train, X_val_full, y_val, label,
+                     seed=RANDOM_STATE):
     if 'Rate' not in feature_list or 'IAT' not in feature_list:
         print(f"  [{label}] Rate and/or IAT not in this candidate set -- nothing to ablate")
         return {'tree': 'keep_both', 'linear': 'keep_both', 'raw': {}}
 
-    X_tr_s, y_tr_s = make_ablation_sample(X_train_full, y_train)
+    X_tr_s, y_tr_s = make_ablation_sample(X_train_full, y_train, random_state=seed)
     variants = {
         'keep_both': feature_list,
         'drop_rate': [c for c in feature_list if c != 'Rate'],
@@ -432,11 +434,11 @@ def ablate_rate_iat(feature_list, X_train_full, y_train, X_val_full, y_val, labe
         'LR': Pipeline([
             ('transform', PowerTransformer(method='yeo-johnson')),
             ('clf', LogisticRegression(class_weight='balanced', max_iter=1000,
-                                       random_state=RANDOM_STATE)),
+                                       random_state=seed)),
         ]),
-        'DT': DecisionTreeClassifier(class_weight='balanced', random_state=RANDOM_STATE),
+        'DT': DecisionTreeClassifier(class_weight='balanced', random_state=seed),
         'RF': RandomForestClassifier(n_estimators=100, class_weight='balanced',
-                                      random_state=RANDOM_STATE, n_jobs=-1),
+                                      random_state=seed, n_jobs=-1),
     }
 
     print(f"\n  [{label}] sample: {len(y_tr_s):,} training rows (train-only)")
@@ -1902,5 +1904,265 @@ print(f"  Plots   -> {PLOT_DIR}")
 print(f"  Results -> {RESULTS_DIR}")
 print(f"  Models  -> {MODELS_DIR}")
 
+print("=" * 70)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PART 3 -- MULTI-SEED STABILITY CHECK
+#
+# Everything above uses one seed (42) throughout: the train/val/test split,
+# every train-only feature-selection decision, and every hyperparameter
+# search. This part asks how much that single seed matters, by repeating
+# preprocessing-through-evaluation under four further seeds and comparing.
+#
+# WHAT IS AND ISN'T RE-DONE PER SEED
+#   Re-done: the split (Section 2's logic), train-only feature reduction
+#   (Section 5), the Rate-vs-IAT ablation (Section 6), the engineered-
+#   feature AUROC screen (Section 7), integer scale-factor derivation and
+#   retraining (Section 15b), and the final model fit for every
+#   scenario/model combination -- using the hyperparameters already found
+#   above (best_params from s1_results/.../s4_results).
+#   NOT re-done: the hyperparameter search itself (Section 10-15b's
+#   RandomizedSearchCV calls). This isolates data-partition and model-fit
+#   variance from the search's own sampling noise, under the assumption
+#   that the optimal configuration is not highly split-sensitive at this
+#   dataset scale -- an assumption not separately tested here.
+#
+# SEED 42 IS ONE OF THE FIVE, NOT JUST A BASELINE
+#   It is the seed used throughout Parts 1-2, fixed before any result
+#   existed (not selected afterward for being favorable), so including it
+#   alongside four fresh seeds is not cherry-picking. Its hyperparameters,
+#   though, were specifically found FOR its own split by the search above,
+#   while the other four reuse those same hyperparameters out-of-sample --
+#   so seed 42's own figures may be mildly favorable relative to the other
+#   four. As a correctness check, seed 42 is also recomputed from scratch
+#   through the same per-seed code path used for the other four, and
+#   compared against the cached s1_results/.../s4_results above: an exact
+#   match confirms this part's logic agrees with Parts 1-2's.
+# ═══════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 70)
+print("03_modeling.py -- PART 3: MULTI-SEED STABILITY CHECK")
+print("=" * 70)
+
+SEEDS = [42, 7, 123, 2024, 99]
+
+BEST_PARAMS = {
+    'S1': {name: res['best_params'] for name, res in s1_results.items()},
+    'S2': {name: res['best_params'] for name, res in s2_results.items()},
+    'S3': {name: res['best_params'] for name, res in s3_results.items()},
+    'S4': {name: res['best_params'] for name, res in s4_results.items()},
+}
+SCENARIO_MODELS = {
+    'S1': ['Logistic Regression', 'Decision Tree', 'Random Forest'],
+    'S2': ['Logistic Regression', 'Decision Tree', 'Random Forest'],
+    'S3': ['Decision Tree'],
+    'S4': ['Decision Tree'],
+}
+STABILITY_METRICS = ['roc_auc', 'pr_auc', 'accuracy', 'prec_atk', 'rec_atk', 'f1_atk']
+
+
+def run_one_seed(seed):
+    """Repeats this file's own preprocessing (Sections 2, 5, 6, 7) and a
+    final-fit-only pass (Sections 9-15b, with hyperparameters frozen from
+    BEST_PARAMS rather than re-searched) under `seed`. Returns per-
+    scenario/model metrics plus the fitted S4 tree's structure."""
+    print(f"\n--- Seed {seed} ---")
+    y_all_s = df[LABEL].astype(int)
+
+    X_train_39_s, X_temp_39_s, y_train_s, y_temp_s = train_test_split(
+        df[feature_cols_all], y_all_s, test_size=0.30, random_state=seed, stratify=y_all_s)
+    X_val_39_s, X_test_39_s, y_val_s, y_test_s = train_test_split(
+        X_temp_39_s, y_temp_s, test_size=0.50, random_state=seed, stratify=y_temp_s)
+
+    S1_reduced_s, _ = reduce_feature_set(
+        feature_cols_all, X_train_39_s, y_train_s, f'S1 (seed {seed})',
+        exclude_from_correlation=RATE_IAT_EXCLUDE, random_state=seed)
+    S2_reduced_s, _ = reduce_feature_set(
+        SMARTNIC_FEATURES, X_train_39_s, y_train_s, f'S2/S3 (seed {seed})',
+        exclude_from_correlation=RATE_IAT_EXCLUDE, random_state=seed)
+
+    S1_ablation_s = ablate_rate_iat(S1_reduced_s, X_train_39_s, y_train_s, X_val_39_s, y_val_s,
+                                    f'S1 (seed {seed})', seed=seed)
+    S2_ablation_s = ablate_rate_iat(S2_reduced_s, X_train_39_s, y_train_s, X_val_39_s, y_val_s,
+                                    f'S2 (seed {seed})', seed=seed)
+    S1_TREE_s = apply_rate_iat_decision(S1_reduced_s, S1_ablation_s['tree'])
+    S1_LR_s   = apply_rate_iat_decision(S1_reduced_s, S1_ablation_s['linear'])
+    S2_TREE_s = apply_rate_iat_decision(S2_reduced_s, S2_ablation_s['tree'])
+    S2_LR_s   = apply_rate_iat_decision(S2_reduced_s, S2_ablation_s['linear'])
+    S3_TREE_s = list(S2_TREE_s)
+
+    FE_train_s = build_engineered_features(X_train_39_s[SMARTNIC_FEATURES], S2_reduced_s)
+    FE_val_s   = build_engineered_features(X_val_39_s[SMARTNIC_FEATURES],   S2_reduced_s)
+    for fe_df, X_sub in [(FE_train_s, X_train_39_s[SMARTNIC_FEATURES]),
+                        (FE_val_s,   X_val_39_s[SMARTNIC_FEATURES])]:
+        fe_df['FE_flow_duration']   = fe_df['FE_flow_duration'].fillna(0)
+        fe_df['FE_burst_intensity'] = fe_df['FE_burst_intensity'].fillna(SMARTNIC_MAX_INT * X_sub['Number'])
+        fe_df['FE_arp_rate']        = fe_df['FE_arp_rate'].fillna(X_sub['ARP'] * SMARTNIC_MAX_INT)
+
+    engineered_auroc_s = {}
+    for col in FE_train_s.columns:
+        x = FE_train_s[col].fillna(FE_train_s[col].median())
+        auc = roc_auc_score(y_train_s, x)
+        engineered_auroc_s[col] = max(auc, 1.0 - auc)
+    kept_engineered_s = sorted([c for c, a in engineered_auroc_s.items() if a >= ENGINEERED_AUROC_MIN])
+    S4_TREE_s = S2_TREE_s + kept_engineered_s
+    print(f"  [seed {seed}] S1_TREE={len(S1_TREE_s)}  S2_TREE={len(S2_TREE_s)}  "
+          f"S4_TREE={len(S4_TREE_s)} ({len(kept_engineered_s)} engineered kept)")
+
+    X_train_S1_s    = build_X(S1_TREE_s, X_train_39_s)
+    X_test_S1_s     = build_X(S1_TREE_s, X_test_39_s)
+    X_train_S1_LR_s = build_X(S1_LR_s,   X_train_39_s)
+    X_test_S1_LR_s  = build_X(S1_LR_s,   X_test_39_s)
+    X_train_S4f_s   = build_X(S4_TREE_s, X_train_39_s, FE_train_s)
+
+    base_lr_s = Pipeline([
+        ('transform', PowerTransformer(method='yeo-johnson')),
+        ('clf', LogisticRegression(class_weight='balanced', max_iter=1000,
+                                   random_state=seed, n_jobs=-1)),
+    ])
+    base_dt_s          = DecisionTreeClassifier(class_weight='balanced', random_state=seed)
+    base_rf_s          = RandomForestClassifier(class_weight='balanced', n_jobs=-1, random_state=seed)
+    base_dt_smartnic_s = DecisionTreeClassifier(max_depth=SMARTNIC_DEPTH, class_weight='balanced',
+                                                random_state=seed)
+
+    def fit_frozen(base_model, params, X_tr, y_tr):
+        m = clone(base_model)
+        m.set_params(**params)
+        m.fit(X_tr, y_tr)
+        return m
+
+    seed_metrics = {sc: {} for sc in SCENARIO_MODELS}
+    for model_name, base_model, X_tr, X_te in [
+        ('Logistic Regression', base_lr_s, X_train_S1_LR_s, X_test_S1_LR_s),
+        ('Decision Tree',       base_dt_s, X_train_S1_s,    X_test_S1_s),
+        ('Random Forest',       base_rf_s, X_train_S1_s,    X_test_S1_s),
+    ]:
+        m = fit_frozen(base_model, BEST_PARAMS['S1'][model_name], X_tr, y_train_s)
+        seed_metrics['S1'][model_name] = evaluate(m, X_te, y_test_s)
+
+    # Float S4 tree, fit only to derive this seed's integer scale factors
+    # (mirrors Section 15 -> 15b's float-then-integer procedure); its own
+    # metrics are not reported, the integer retrain below is.
+    s4_float_s = fit_frozen(base_dt_smartnic_s, BEST_PARAMS['S4']['Decision Tree'],
+                            X_train_S4f_s, y_train_s)
+    derived_scales_s = _derive_scale_factors(s4_float_s, S4_TREE_s)
+    scale_rate_s  = derived_scales_s.get('Rate', 1_000)
+    scale_iat_s   = derived_scales_s.get('IAT', 1_000_000)
+    scale_ratio_s = max((derived_scales_s.get(f, 1_000) for f in _FE_RATIO_FEATURES), default=1_000)
+
+    (X_train_39i_s, X_val_39i_s, X_test_39i_s,
+     FE_train_i_s, FE_val_i_s, FE_test_i_s) = rebuild_integer_features(
+        X_train_39_s, X_val_39_s, X_test_39_s, scale_rate_s, scale_iat_s, scale_ratio_s, S2_reduced_s)
+
+    X_train_S2_s    = build_X(S2_TREE_s, X_train_39i_s)
+    X_test_S2_s     = build_X(S2_TREE_s, X_test_39i_s)
+    X_train_S2_LR_s = build_X(S2_LR_s,   X_train_39i_s)
+    X_test_S2_LR_s  = build_X(S2_LR_s,   X_test_39i_s)
+    X_train_S3_s, X_test_S3_s = X_train_S2_s, X_test_S2_s
+    X_train_S4_s = build_X(S4_TREE_s, X_train_39i_s, FE_train_i_s)
+    X_test_S4_s  = build_X(S4_TREE_s, X_test_39i_s,  FE_test_i_s)
+
+    for model_name, base_model, X_tr, X_te in [
+        ('Logistic Regression', base_lr_s, X_train_S2_LR_s, X_test_S2_LR_s),
+        ('Decision Tree',       base_dt_s, X_train_S2_s,    X_test_S2_s),
+        ('Random Forest',       base_rf_s, X_train_S2_s,    X_test_S2_s),
+    ]:
+        m = fit_frozen(base_model, BEST_PARAMS['S2'][model_name], X_tr, y_train_s)
+        seed_metrics['S2'][model_name] = evaluate(m, X_te, y_test_s)
+
+    s3_model_s = fit_frozen(base_dt_smartnic_s, BEST_PARAMS['S3']['Decision Tree'], X_train_S3_s, y_train_s)
+    seed_metrics['S3']['Decision Tree'] = evaluate(s3_model_s, X_test_S3_s, y_test_s)
+
+    s4_model_s = fit_frozen(base_dt_smartnic_s, BEST_PARAMS['S4']['Decision Tree'], X_train_S4_s, y_train_s)
+    seed_metrics['S4']['Decision Tree'] = evaluate(s4_model_s, X_test_S4_s, y_test_s)
+
+    print(f"  [seed {seed}] S4 tree: depth={s4_model_s.get_depth()}  "
+          f"nodes={s4_model_s.tree_.node_count}  top-split={S4_TREE_s[s4_model_s.tree_.feature[0]]}")
+
+    return {
+        'metrics': {sc: {m: {k: seed_metrics[sc][m][k] for k in STABILITY_METRICS}
+                         for m in SCENARIO_MODELS[sc]} for sc in SCENARIO_MODELS},
+        'feature_lists': {'S1_TREE': S1_TREE_s, 'S2_TREE': S2_TREE_s, 'S4_TREE': S4_TREE_s},
+        's4_tree_depth': int(s4_model_s.get_depth()),
+        's4_tree_nodes': int(s4_model_s.tree_.node_count),
+        's4_top_split_feature': S4_TREE_s[s4_model_s.tree_.feature[0]],
+    }
+
+
+print("\n--- Self-test: recomputing seed 42 and comparing to cached results above ---")
+seed42_recomputed = run_one_seed(42)
+_cached_metrics_42 = {
+    'S1': {m: {k: s1_results[m]['test'][k] for k in STABILITY_METRICS} for m in SCENARIO_MODELS['S1']},
+    'S2': {m: {k: s2_results[m]['test'][k] for k in STABILITY_METRICS} for m in SCENARIO_MODELS['S2']},
+    'S3': {m: {k: s3_results[m]['test'][k] for k in STABILITY_METRICS} for m in SCENARIO_MODELS['S3']},
+    'S4': {m: {k: s4_results[m]['test'][k] for k in STABILITY_METRICS} for m in SCENARIO_MODELS['S4']},
+}
+_max_abs_diff = 0.0
+for sc in SCENARIO_MODELS:
+    for m in SCENARIO_MODELS[sc]:
+        diff = abs(seed42_recomputed['metrics'][sc][m]['roc_auc'] - _cached_metrics_42[sc][m]['roc_auc'])
+        _max_abs_diff = max(_max_abs_diff, diff)
+        print(f"  [{sc}][{m}] recomputed={seed42_recomputed['metrics'][sc][m]['roc_auc']:.6f}  "
+              f"cached={_cached_metrics_42[sc][m]['roc_auc']:.6f}  "
+              f"{'OK' if diff < 1e-6 else f'MISMATCH (diff={diff:.6f})'}")
+print(f"  Max |recomputed - cached| ROC-AUC: {_max_abs_diff:.8f}  "
+      f"-> {'PASS' if _max_abs_diff < 1e-6 else 'FAIL -- investigate before trusting other seeds'}")
+
+print("\n--- Running the remaining 4 seeds ---")
+_per_seed_results = {42: seed42_recomputed}
+for _seed in SEEDS:
+    if _seed == 42:
+        continue
+    _per_seed_results[_seed] = run_one_seed(_seed)
+
+# Seed 42's row in the aggregate uses the CACHED, already-published metrics
+# (identical to the self-test's recomputation above, confirmed to agree)
+# rather than the recomputation itself, since those cached values are what
+# the rest of this file -- and the paper -- actually report.
+_metrics_for_aggregate = {s: r['metrics'] for s, r in _per_seed_results.items()}
+_metrics_for_aggregate[42] = _cached_metrics_42
+
+stability_summary = {}
+for sc in SCENARIO_MODELS:
+    stability_summary[sc] = {}
+    for m in SCENARIO_MODELS[sc]:
+        stability_summary[sc][m] = {}
+        for metric in STABILITY_METRICS:
+            vals = [_metrics_for_aggregate[s][sc][m][metric] for s in SEEDS]
+            stability_summary[sc][m][metric] = {
+                'mean': float(np.mean(vals)), 'std': float(np.std(vals, ddof=1)), 'values': vals,
+            }
+
+print("\n" + "=" * 70)
+print("MULTI-SEED STABILITY SUMMARY (5 seeds: 42, 7, 123, 2024, 99)")
+print("=" * 70)
+print(f"  {'Scenario':<10} {'Model':<22} {'ROC-AUC':>16} {'Pre-Atk':>16} {'Rec-Atk':>16} {'F1-Atk':>16}")
+for sc in SCENARIO_MODELS:
+    for m in SCENARIO_MODELS[sc]:
+        row = stability_summary[sc][m]
+        def fmt(key): return f"{row[key]['mean']:.4f}+/-{row[key]['std']:.4f}"
+        print(f"  {sc:<10} {m:<22} {fmt('roc_auc'):>16} {fmt('prec_atk'):>16} {fmt('rec_atk'):>16} {fmt('f1_atk'):>16}")
+
+print(f"\n  S4 tree structure across seeds:")
+for _seed in SEEDS:
+    r = _per_seed_results[_seed]
+    print(f"    seed {_seed:>5}: depth={r['s4_tree_depth']}  nodes={r['s4_tree_nodes']}  "
+          f"top-split={r['s4_top_split_feature']}")
+
+_stability_output = {
+    'seeds': SEEDS,
+    'self_test_max_abs_roc_auc_diff': _max_abs_diff,
+    'per_seed_feature_lists': {str(s): r['feature_lists'] for s, r in _per_seed_results.items()},
+    'per_seed_s4_tree': {str(s): {'depth': r['s4_tree_depth'], 'nodes': r['s4_tree_nodes'],
+                                  'top_split_feature': r['s4_top_split_feature']}
+                        for s, r in _per_seed_results.items()},
+    'aggregate': stability_summary,
+}
+_stability_path = os.path.join(RESULTS_DIR, 'seed_stability_summary.json')
+with open(_stability_path, 'w') as _f:
+    json.dump(_stability_output, _f, indent=2)
+print(f"\n  Full details saved -> {_stability_path}")
+
+print("\n" + "=" * 70)
+print("PART 3 (MULTI-SEED STABILITY CHECK) COMPLETE")
 print("=" * 70)
 

@@ -1,29 +1,48 @@
 #!/usr/bin/env python3
 """
-04_generate_p4.py -- Generate P4 program and test harness from fitted S4 tree
+04_generate_p4.py -- Generate P4 programs, test harnesses, and a resource
+summary for the S3 and S4 Decision Trees
 
 PURPOSE
 -------
-Reads the integer-trained S4 Decision Tree from S4_results.pkl and the
-preprocessing summary from preprocessing_summary.json, then generates:
+Reads each scenario's integer-trained Decision Tree and the preprocessing
+summary, then generates, for S3 and S4 in turn:
 
   p4_validation/
-    arp_detector.p4          -- P4_16 program (compile with p4c, run on BMv2)
-    table_entries.txt        -- match-action table entries for simple_switch_CLI
-    test_harness.py          -- sends test flows through BMv2, compares to Python
-    flow_test_vectors.csv    -- test-set rows with Python predictions (ground truth)
-    README.md                -- step-by-step instructions for the VM
+    arp_detector_s3.p4, table_entries_s3.txt, test_harness_s3.py,
+        flow_test_vectors_s3.csv, README_s3.md        -- S3 (no feature
+        engineering; the scenario recommended as the operational default)
+    arp_detector.p4,    table_entries.txt,    test_harness.py,
+        flow_test_vectors.csv,    README.md            -- S4 (adds the
+        two engineered features its tree actually splits on)
 
-WHAT THE GENERATED P4 PROGRAM DOES
-------------------------------------
-Each test-set flow is represented as a custom Ethernet frame carrying all
-24 S4 feature values in a custom header. The P4 program:
+Both scenarios share one test split and one set of integer scale factors
+(derived once from the fitted S4 tree in 03_modeling.py Section 15b and
+reused for S2/S3/S4 alike), so the dataset is loaded and quantized once
+and reused for both. Each scenario gets its own custom ethertype pair so
+the two programs' traffic can never be cross-confused on the same VM.
+
+After both are generated, a final section reads the resulting .p4 files
+back and reports each one's resource footprint -- program size, tables,
+actions, header width, and register count -- directly from the generated
+artifact rather than from an estimate, and saves it to
+p4_resource_summary.json alongside the modeling results.
+
+WHAT THE GENERATED P4 PROGRAMS DO
+----------------------------------
+Each test-set flow is represented as a custom Ethernet frame carrying the
+scenario's feature values in a custom header. Each P4 program:
   1. Parses the custom header
-  2. Computes the FE_* engineered features using integer arithmetic
-  3. Applies the fitted decision tree as a sequence of exact-match / LPM
-     table lookups (one table per tree level)
+  2. Reads any FE_* engineered feature values directly from the header --
+     they are precomputed in Python using the same integer arithmetic as
+     training, not computed in the data plane (see the design note above
+     tree_to_p4_apply() for why)
+  3. Applies the fitted decision tree as nested if/else comparisons inside
+     a single action, reached via one table keyed on a constant ethertype
+     match (one table total, regardless of tree depth)
   4. Sets metadata.verdict = 0 (Benign) or 1 (Attack)
-  5. Reflects the packet back out the same port with verdict in a result header
+  5. Reflects the packet back out port 1 (veth1) with verdict in a result
+     header -- a fixed port, not the ingress port the packet arrived on
 
 The test harness sends each flow vector as one crafted packet, reads the
 reflected verdict, and compares it to the Python model's prediction on the
@@ -33,17 +52,19 @@ USAGE
 -----
   python 04_generate_p4.py
 
-Then copy the p4_validation/ folder to your P4 VM and follow README.md.
+Then copy the p4_validation/ folder to your P4 VM and follow README_s3.md
+and README.md for the respective scenario.
 
 PATHS  (match 03_modeling.py)
 -----
 """
 
-import os, sys, io, json, pickle, csv, textwrap
+import os, sys, io, json, pickle, re, textwrap
 import numpy as np
 import pandas as pd
 import joblib
 from sklearn.tree import _tree
+from sklearn.model_selection import train_test_split
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
@@ -54,12 +75,10 @@ MODELS_DIR  = os.path.join(BASE, 'modeling', 'models')
 DATA_PATH   = os.path.join(BASE, 'data', 'final_dataset.csv')
 OUT_DIR     = os.path.join(BASE, 'p4_validation')
 
-S4_RESULTS_PATH  = os.path.join(RESULTS_DIR, 'S4_results.pkl')
-S4_MODEL_PATH    = os.path.join(MODELS_DIR, 'S4_Decision_Tree.joblib')
-SUMMARY_PATH     = os.path.join(RESULTS_DIR, 'preprocessing_summary.json')
-THRESHOLD_PATH   = os.path.join(RESULTS_DIR, 'S4_threshold_extraction.json')
+SUMMARY_PATH    = os.path.join(RESULTS_DIR, 'preprocessing_summary.json')
+THRESHOLD_PATH  = os.path.join(RESULTS_DIR, 'S4_threshold_extraction.json')
 
-# Number of test-set rows to include in the test vectors file.
+# Number of test-set rows to include in each scenario's test vectors file.
 # Set to None to use the full test set (~210,863 rows).
 # Set to an integer (e.g. 2000) for a faster stratified sample.
 N_TEST_VECTORS = None  # None = full test set
@@ -68,38 +87,23 @@ RANDOM_STATE   = 42
 SMARTNIC_MAX_INT = 2**32 - 1
 
 print("=" * 70)
-print("04_generate_p4.py -- P4 Program Generator")
+print("04_generate_p4.py -- P4 Program Generator (S3 and S4)")
 print("=" * 70)
 
-# ── Load artifacts ────────────────────────────────────────────────────────────
-for path, label in [(S4_RESULTS_PATH, 'S4_results.pkl'),
-                    (S4_MODEL_PATH,   'S4_Decision_Tree.joblib'),
-                    (SUMMARY_PATH,    'preprocessing_summary.json')]:
+for path, label in [(SUMMARY_PATH, 'preprocessing_summary.json'),
+                    (THRESHOLD_PATH, 'S4_threshold_extraction.json')]:
     if not os.path.exists(path):
         sys.exit(f"\nERROR: {path} not found.\nRun 03_modeling.py first.")
 
-with open(S4_RESULTS_PATH, 'rb') as f:
-    s4 = pickle.load(f)
 with open(SUMMARY_PATH) as f:
     summary = json.load(f)
-
-# save_results() in 03_modeling.py strips the fitted model object out of the
-# slim *_results.pkl and joblib-dumps it separately -- the model is never
-# inside S4_results.pkl itself.
-tree_model = joblib.load(S4_MODEL_PATH)
-t          = tree_model.tree_
-S4_TREE    = summary['feature_lists']['S4_TREE']
-
-# Load scale factors actually used to retrain the integer S4 tree.
-# Section 20 of 03_modeling.py verifies and saves these to
-# S4_threshold_extraction.json -- preprocessing_summary.json does NOT carry
-# them (that key was removed after being found to reference variables not
-# yet defined at the point in the script where it was written).
-if not os.path.exists(THRESHOLD_PATH):
-    sys.exit(f"\nERROR: {THRESHOLD_PATH} not found.\nRun 03_modeling.py first "
-             f"(Section 20 writes this file after integer retraining).")
 with open(THRESHOLD_PATH) as f:
     _threshold_info = json.load(f)
+
+# Scale factors are derived once, from the fitted S4 tree (03_modeling.py
+# Section 15b), and reused as-is for S2, S3, and S4 -- all three share one
+# integer-quantized feature matrix, so there is nothing scenario-specific
+# to derive here.
 _scale_factors  = _threshold_info['scale_factors_used']
 INT_SCALE_RATE  = _scale_factors['INT_SCALE_RATE']
 INT_SCALE_IAT   = _scale_factors['INT_SCALE_IAT']
@@ -110,14 +114,78 @@ INT_SCALE_RATIO = _scale_factors['INT_SCALE_RATIO']
 # reduction, matching build_engineered_features() in 03_modeling.py exactly.
 S2_reduced = summary['S2_diagnostics']['reduced']
 
-print(f"\n  Tree depth : {tree_model.get_depth()}")
-print(f"  Nodes      : {t.node_count}")
-print(f"  Features   : {len(S4_TREE)}  ->  {S4_TREE}")
-print(f"  Scale factors: RATE={INT_SCALE_RATE:,}  IAT={INT_SCALE_IAT:,}  RATIO={INT_SCALE_RATIO:,}")
+print(f"\n  Scale factors: RATE={INT_SCALE_RATE:,}  IAT={INT_SCALE_IAT:,}  RATIO={INT_SCALE_RATIO:,}")
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# ── Helper: walk the tree ─────────────────────────────────────────────────────
+# ── Shared dataset: one test split, quantized once, reused by every scenario ──
+df = pd.read_csv(DATA_PATH)
+LABEL = 'label'
+feature_cols_all = [c for c in df.columns if c != LABEL]
+y_all = df[LABEL].astype(int)
+
+_, X_temp, _, y_temp = train_test_split(
+    df[feature_cols_all], y_all, test_size=0.30,
+    random_state=RANDOM_STATE, stratify=y_all
+)
+_, X_test, _, y_test = train_test_split(
+    X_temp, y_temp, test_size=0.50,
+    random_state=RANDOM_STATE, stratify=y_temp
+)
+
+
+def quantize(X):
+    """Mirrors apply_integer_quantization() in 03_modeling.py term for
+    term, so these test vectors are built exactly the way every scenario's
+    integer model was trained."""
+    X = X.copy()
+    sentinel = X['Rate'] == SMARTNIC_MAX_INT
+    X['Rate'] = (X['Rate'].where(sentinel, X['Rate'] * INT_SCALE_RATE)).astype(np.int64)
+    X.loc[sentinel, 'Rate'] = SMARTNIC_MAX_INT
+    X['IAT'] = (X['IAT'] * INT_SCALE_IAT).astype(np.int64)
+    for col in ['Min', 'Max', 'Header_Length', 'AVG', 'Tot sum', 'Tot size',
+                'Variance', 'Number', 'ARP', 'TCP', 'UDP', 'ICMP', 'IGMP',
+                'HTTP', 'HTTPS', 'DNS', 'SSH', 'DHCP',
+                'syn_flag_number', 'ack_flag_number', 'fin_flag_number',
+                'rst_flag_number', 'psh_flag_number',
+                'ece_flag_number', 'cwr_flag_number', 'Protocol Type', 'Time_To_Live']:
+        if col in X.columns:
+            X[col] = X[col].astype(np.int64)
+    return X
+
+
+X_test_int = quantize(X_test)
+
+
+def build_fe(X):
+    """Mirrors build_engineered_features(..., integer_mode=True) plus the
+    caller-side sentinel fillna in rebuild_integer_features(), both in
+    03_modeling.py, term for term. Only called for scenarios whose tree
+    actually uses an FE_* feature (S4); S3 has none, so it never calls
+    this at all."""
+    fe = pd.DataFrame(index=X.index)
+    safe_rate = X['Rate'].replace(SMARTNIC_MAX_INT, np.nan)
+    fe['FE_burst_intensity']    = (safe_rate * X['Number']).fillna(
+                                      np.int64(SMARTNIC_MAX_INT) * X['Number']).astype(np.int64)
+    fe['FE_flow_duration']      = (X['Number'] // safe_rate.replace(0, np.nan)).fillna(0).astype(np.int64)
+    fe['FE_size_cv_proxy']      = (X['Variance'] // (X['AVG'] + 1)).astype(np.int64)
+    proto_cols_full = ['HTTP', 'HTTPS', 'DNS', 'SSH', 'DHCP', 'TCP', 'UDP', 'ARP', 'ICMP', 'IGMP']
+    proto_cols = [c for c in proto_cols_full if c in S2_reduced]
+    fe['FE_protocol_diversity'] = (X[proto_cols] > 0).sum(axis=1).astype(np.int64)
+    fe['FE_size_range']         = (X['Max'] - X['Min']).astype(np.int64)
+    fe['FE_payload_ratio']      = (((X['Tot size'] - X['Header_Length']) * INT_SCALE_RATIO)
+                                    // (X['Tot size'] + 1)).astype(np.int64)
+    fe['FE_header_ratio']       = ((X['Header_Length'] * 100) // (X['Tot size'] + 1)).astype(np.int64)
+    app_layer_cols_full = ['HTTP', 'HTTPS', 'DNS', 'SSH', 'DHCP']
+    app_cols = [c for c in app_layer_cols_full if c in S2_reduced]
+    fe['FE_no_app_layer']       = ((X[app_cols].sum(axis=1)) == 0).astype(np.int64)
+    fe['FE_avg_min_ratio']      = (X['AVG'] // (X['Min'] + 1)).astype(np.int64)
+    fe['FE_arp_rate']           = (X['ARP'] * safe_rate).fillna(
+                                      X['ARP'] * np.int64(SMARTNIC_MAX_INT)).astype(np.int64)
+    return fe
+
+
+# ── Helper: walk a fitted tree into a flat node list ──────────────────────────
 def get_tree_nodes(tree_model, feature_names):
     """Return list of dicts describing every node in the tree."""
     t = tree_model.tree_
@@ -146,59 +214,26 @@ def get_tree_nodes(tree_model, feature_names):
     walk(0)
     return nodes
 
-nodes = get_tree_nodes(tree_model, S4_TREE)
-leaves = [n for n in nodes if n['is_leaf']]
-internals = [n for n in nodes if not n['is_leaf']]
 
-print(f"\n  Internal nodes: {len(internals)}  |  Leaves: {len(leaves)}")
-print(f"\n  Tree structure:")
-for n in nodes:
-    indent = '  ' * n['depth']
-    if n['is_leaf']:
-        print(f"    {indent}[Leaf {n['id']}] -> {n['class_label']} (n={n['n_samples']:,})")
-    else:
-        print(f"    {indent}[Node {n['id']}] if {n['feature']} <= {n['threshold']:,}: "
-              f"goto {n['left_child']} else goto {n['right_child']}")
-
-# ── Feature index map (position in the custom P4 header) ─────────────────────
-# Every S4 feature gets a fixed slot in the custom header, 32 bits each.
-# This is simple and unambiguous; the test harness fills them in the same order.
-feat_idx = {f: i for i, f in enumerate(S4_TREE)}
-
-# Features that are computed by the P4 program from raw inputs vs. passed in
-# The baseline features are "raw" (passed directly in the header).
-# The FE_* features are computed inside P4 from the raw fields.
-FE_FEATURES  = [f for f in S4_TREE if f.startswith('FE_')]
-RAW_FEATURES = [f for f in S4_TREE if not f.startswith('FE_')]
-
-print(f"\n  Raw features ({len(RAW_FEATURES)}): {RAW_FEATURES}")
-print(f"  FE features  ({len(FE_FEATURES)}):  {FE_FEATURES}")
-
-# ── 1. Generate arp_detector.p4 ───────────────────────────────────────────────
-def indent(text, n=4):
-    return textwrap.indent(textwrap.dedent(text), ' ' * n)
-
-# Build the tree as nested if/else in P4 apply block
-#
 # DESIGN NOTE -- why P4 does not compute FE_* itself
-#   Only 2 of the 8 FE_* features (FE_burst_intensity, FE_payload_ratio) are
-#   ever used by the tree's splits, and computing them in the data plane
-#   would require source raw columns (Number, Tot size) that are not part
-#   of S4_TREE/RAW_FEATURES at all -- they were absorbed into FE_* during
-#   feature engineering and never sent as their own header fields. Rather
-#   than widening the header just to re-derive values Python has already
-#   computed correctly (and verified against the cached model), this test
-#   sends both FE_* values precomputed, exactly as they appear in
-#   flow_test_vectors.csv. P4 only does the match-action comparisons --
-#   which is the actual thing this experiment is validating: does the
-#   tree's topology, re-expressed as P4 if/else logic, reproduce the
-#   trained model's verdicts.
+#   For S4, only 2 of its 8 FE_* features (FE_burst_intensity,
+#   FE_payload_ratio) are ever used by the tree's splits, and computing
+#   them in the data plane would require source raw columns (Number, Tot
+#   size) that are not part of the tree's own feature list at all -- they
+#   were absorbed into FE_* during feature engineering and never sent as
+#   their own header fields. Rather than widen the header just to
+#   re-derive values Python has already computed correctly (and verified
+#   against the cached model), both scenarios send every FE_* value they
+#   use precomputed, exactly as they appear in their flow_test_vectors
+#   CSV. P4 only does the match-action comparisons -- which is the actual
+#   thing this experiment validates: does the tree's topology, re-expressed
+#   as P4 if/else logic, reproduce the trained model's verdicts. S3 has no
+#   engineered features at all, so this note is moot for it -- every one
+#   of its header fields is a directly observable raw feature.
 def tree_to_p4_apply(nodes):
     node_map = {n['id']: n for n in nodes}
 
     def field_ref(fname):
-        # Every S4 feature used by a split -- raw or FE_* -- is sent
-        # directly as a header field (see HEADER_FIELDS below).
         clean = fname.replace(' ', '_').replace('-', '_')
         return f"hdr.flow.{clean}"
 
@@ -220,54 +255,103 @@ def tree_to_p4_apply(nodes):
 
     return emit_node(0)
 
-# Build the full metadata struct fields for FE features used in the tree
-fe_in_tree = sorted(set(
-    n['feature'] for n in internals if n['feature'] and n['feature'].startswith('FE_')
-))
 
-# Every field the tree's splits reference -- raw features plus the FE_*
-# features actually used -- gets one bit<64> slot in the header, in this
-# fixed order. The test harness packs flow_test_vectors.csv columns in the
-# exact same order, so the two stay in lockstep without separate bookkeeping.
-#
-# bit<64> throughout -- with the derived scale factors (commonly 1e10 or
-# more; see INT_SCALE_* above), a scaled Rate value alone can reach ~1e14
-# and FE_burst_intensity (Rate * Number) can reach ~1e17, both far beyond
-# bit<32>'s ~4.3e9 ceiling. bit<64> removes the overflow/truncation risk
-# regardless of which scale factor a given run derives.
-HEADER_FIELDS = RAW_FEATURES + fe_in_tree
+def generate_scenario_p4(scenario, results_path, model_path, file_suffix,
+                         ethertype_flow, ethertype_result):
+    """Generates arp_detector<file_suffix>.p4, table_entries<file_suffix>.txt,
+    flow_test_vectors<file_suffix>.csv, test_harness<file_suffix>.py, and
+    README<file_suffix or nothing>.md for one fitted scenario tree, into
+    OUT_DIR. Returns a dict of resource-relevant facts (tree depth, node
+    counts, header field count) consumed by the resource-summary section
+    at the end of this script.
+    """
+    print("\n" + "=" * 70)
+    print(f"SCENARIO {scenario}")
+    print("=" * 70)
 
-raw_header_fields = '\n    '.join(
-    f"bit<64> {f.replace(' ','_').replace('-','_').replace('/','_')};" for f in HEADER_FIELDS
-)
+    if not os.path.exists(results_path):
+        sys.exit(f"\nERROR: {results_path} not found.\nRun 03_modeling.py first.")
+    if not os.path.exists(model_path):
+        sys.exit(f"\nERROR: {model_path} not found.\nRun 03_modeling.py first.")
 
-p4_program = f"""\
-/* arp_detector.p4
- * Generated by 04_generate_p4.py from fitted S4 Decision Tree
+    # save_results() in 03_modeling.py strips the fitted model object out
+    # of the slim *_results.pkl and joblib-dumps it separately -- the
+    # model is never inside <scenario>_results.pkl itself.
+    tree_model = joblib.load(model_path)
+    t          = tree_model.tree_
+    tree_feature_list = summary['feature_lists'][f'{scenario}_TREE']
+
+    print(f"\n  Tree depth : {tree_model.get_depth()}")
+    print(f"  Nodes      : {t.node_count}")
+    print(f"  Features   : {len(tree_feature_list)}  ->  {tree_feature_list}")
+
+    nodes = get_tree_nodes(tree_model, tree_feature_list)
+    leaves = [n for n in nodes if n['is_leaf']]
+    internals = [n for n in nodes if not n['is_leaf']]
+
+    print(f"\n  Internal nodes: {len(internals)}  |  Leaves: {len(leaves)}")
+    print(f"\n  Tree structure:")
+    for n in nodes:
+        indent = '  ' * n['depth']
+        if n['is_leaf']:
+            print(f"    {indent}[Leaf {n['id']}] -> {n['class_label']} (n={n['n_samples']:,})")
+        else:
+            print(f"    {indent}[Node {n['id']}] if {n['feature']} <= {n['threshold']:,}: "
+                  f"goto {n['left_child']} else goto {n['right_child']}")
+
+    FE_FEATURES  = [f for f in tree_feature_list if f.startswith('FE_')]
+    RAW_FEATURES = [f for f in tree_feature_list if not f.startswith('FE_')]
+    print(f"\n  Raw features ({len(RAW_FEATURES)}): {RAW_FEATURES}")
+    print(f"  FE features  ({len(FE_FEATURES)}):  {FE_FEATURES}")
+
+    # Every field the tree's splits reference -- raw features plus the
+    # FE_* features actually used -- gets one bit<64> slot in the header,
+    # in this fixed order. The test harness packs its CSV columns in the
+    # exact same order, so the two stay in lockstep without separate
+    # bookkeeping.
+    #
+    # bit<64> throughout -- with the derived scale factors (commonly 1e10
+    # or more), a scaled Rate value alone can reach ~1e14 and
+    # FE_burst_intensity (Rate * Number) can reach ~1e17, both far beyond
+    # bit<32>'s ~4.3e9 ceiling. bit<64> removes the overflow/truncation
+    # risk regardless of which scale factor a given run derives.
+    fe_in_tree = sorted(set(
+        n['feature'] for n in internals if n['feature'] and n['feature'].startswith('FE_')
+    ))
+    HEADER_FIELDS = RAW_FEATURES + fe_in_tree
+
+    raw_header_fields = '\n    '.join(
+        f"bit<64> {f.replace(' ','_').replace('-','_').replace('/','_')};" for f in HEADER_FIELDS
+    )
+
+    p4_filename = f"arp_detector{file_suffix}.p4"
+    p4_program = f"""\
+/* {p4_filename}
+ * Generated by 04_generate_p4.py from the fitted {scenario} Decision Tree
  * P4_16 -- compiles with p4c, runs on BMv2 simple_switch
  *
  * WHAT THIS DOES
  *   Receives crafted Ethernet frames carrying a custom 'flow' header with
  *   integer-scaled feature values (one frame per flow), all precomputed in
- *   Python -- including the 2 FE_* features the tree actually splits on.
+ *   Python -- including any FE_* features the tree actually splits on.
  *   Applies the fitted depth-{tree_model.get_depth()} Decision Tree as nested if/else
  *   logic, sets a verdict (0=Benign, 1=Attack), and reflects the packet
  *   back with a 'result' header prepended.
  *
- * SCALE FACTORS (applied when 04_generate_p4.py builds flow_test_vectors.csv)
+ * SCALE FACTORS (applied when 04_generate_p4.py builds the test vectors)
  *   Rate : x{INT_SCALE_RATE:,}   IAT : x{INT_SCALE_IAT:,}   Ratios: x{INT_SCALE_RATIO:,}
  *
  * CUSTOM ETHERTYPE
- *   0x1234 = flow feature frame (input to classifier)
- *   0x1235 = result frame (reflected back with verdict)
+ *   {ethertype_flow:#06x} = flow feature frame (input to classifier)
+ *   {ethertype_result:#06x} = result frame (reflected back with verdict)
  */
 
 #include <core.p4>
 #include <v1model.p4>
 
 // ── Custom ethertypes ─────────────────────────────────────────────────────────
-const bit<16> TYPE_FLOW   = 0x1234;
-const bit<16> TYPE_RESULT = 0x1235;
+const bit<16> TYPE_FLOW   = {ethertype_flow:#06x};
+const bit<16> TYPE_RESULT = {ethertype_result:#06x};
 const bit<32> MAX_INT_SENTINEL = {SMARTNIC_MAX_INT};
 
 // ── Headers ───────────────────────────────────────────────────────────────────
@@ -277,12 +361,10 @@ header ethernet_t {{
     bit<16> etherType;
 }}
 
-// One 64-bit slot per field the tree's splits reference: the 16 raw
-// features plus the 2 FE_* features actually used (FE_burst_intensity,
-// FE_payload_ratio), both precomputed in Python exactly as they appear in
-// flow_test_vectors.csv -- P4 does not compute FE_* itself (see the design
-// note above tree_to_p4_apply()). All values are pre-scaled integers
-// (see scale factors above).
+// One 64-bit slot per field the tree's splits reference, both precomputed
+// in Python exactly as they appear in the test vectors CSV -- P4 does not
+// compute FE_* itself (see the design note above tree_to_p4_apply()).
+// All values are pre-scaled integers (see scale factors above).
 header flow_t {{
     {raw_header_fields}
 }}
@@ -407,149 +489,82 @@ V1Switch(
 ) main;
 """
 
-p4_path = os.path.join(OUT_DIR, 'arp_detector.p4')
-with open(p4_path, 'w', encoding='utf-8') as f:
-    f.write(p4_program)
-print(f"\n[1/5] Generated: {p4_path}")
+    p4_path = os.path.join(OUT_DIR, p4_filename)
+    with open(p4_path, 'w', encoding='utf-8') as f:
+        f.write(p4_program)
+    print(f"\n[1/5] Generated: {p4_path}")
 
-# ── 2. Generate table_entries.txt (empty -- tree uses const entries) ──────────
-# The tree logic is embedded as const entries in the P4 source, so no
-# runtime table population is needed. This file is a placeholder showing
-# the switch startup commands only.
-startup_commands = f"""\
-# table_entries.txt
+    # ── 2. table_entries -- empty, tree uses const entries ───────────────
+    entries_filename = f"table_entries{file_suffix}.txt"
+    startup_commands = f"""\
+# {entries_filename}
 # No runtime table entries needed -- the decision tree is encoded as
-# const entries directly in arp_detector.p4.
+# const entries directly in {p4_filename}.
 #
 # BMv2 startup command (run inside the VM):
 #   sudo simple_switch --interface 0@veth0 --interface 1@veth1 \\
-#       arp_detector.json
+#       arp_detector{file_suffix}.json
 #
-# The compiled JSON (arp_detector.json) is produced by:
-#   p4c --target bmv2 --arch v1model arp_detector.p4
+# The compiled JSON is produced by:
+#   p4c --target bmv2 --arch v1model {p4_filename}
 """
-entries_path = os.path.join(OUT_DIR, 'table_entries.txt')
-with open(entries_path, 'w', encoding='utf-8') as f:
-    f.write(startup_commands)
-print(f"[2/5] Generated: {entries_path}")
+    entries_path = os.path.join(OUT_DIR, entries_filename)
+    with open(entries_path, 'w', encoding='utf-8') as f:
+        f.write(startup_commands)
+    print(f"[2/5] Generated: {entries_path}")
 
-# ── 3. Generate flow test vectors ─────────────────────────────────────────────
-n_desc = "full test set" if N_TEST_VECTORS is None else f"{N_TEST_VECTORS} rows, stratified"
-print(f"\n[3/5] Building test vectors ({n_desc})...")
+    # ── 3. Flow test vectors ──────────────────────────────────────────────
+    n_desc = "full test set" if N_TEST_VECTORS is None else f"{N_TEST_VECTORS} rows, stratified"
+    print(f"\n[3/5] Building test vectors ({n_desc})...")
 
-# Load the dataset to reconstruct the test split exactly as 03_modeling.py did
-from sklearn.model_selection import train_test_split
+    if FE_FEATURES:
+        FE_test = build_fe(X_test_int)
+        X_scenario = pd.concat([X_test_int[RAW_FEATURES], FE_test[FE_FEATURES]], axis=1)[tree_feature_list]
+    else:
+        X_scenario = X_test_int[tree_feature_list]
 
-df = pd.read_csv(DATA_PATH)
-LABEL = 'label'
-feature_cols_all = [c for c in df.columns if c != LABEL]
-y_all = df[LABEL].astype(int)
+    py_preds = tree_model.predict(X_scenario)
 
-_, X_temp, _, y_temp = train_test_split(
-    df[feature_cols_all], y_all, test_size=0.30,
-    random_state=RANDOM_STATE, stratify=y_all
-)
-_, X_test, _, y_test = train_test_split(
-    X_temp, y_temp, test_size=0.50,
-    random_state=RANDOM_STATE, stratify=y_temp
-)
+    ben_idx = X_scenario.index[y_test.loc[X_scenario.index] == 0]
+    atk_idx = X_scenario.index[y_test.loc[X_scenario.index] == 1]
+    rng = np.random.RandomState(RANDOM_STATE)
+    if N_TEST_VECTORS is None:
+        sample_idx = X_scenario.index  # full test set
+    else:
+        n_each = N_TEST_VECTORS // 2
+        sample_idx = np.concatenate([
+            rng.choice(ben_idx, min(n_each, len(ben_idx)), replace=False),
+            rng.choice(atk_idx, min(n_each, len(atk_idx)), replace=False),
+        ])
+        rng.shuffle(sample_idx)
 
-# Apply the same integer quantization as Section 15b
-def quantize(X):
-    X = X.copy()
-    sentinel = X['Rate'] == SMARTNIC_MAX_INT
-    X['Rate'] = (X['Rate'].where(sentinel, X['Rate'] * INT_SCALE_RATE)).astype(np.int64)
-    X.loc[sentinel, 'Rate'] = SMARTNIC_MAX_INT
-    X['IAT'] = (X['IAT'] * INT_SCALE_IAT).astype(np.int64)
-    for col in ['Min', 'Max', 'Header_Length', 'AVG', 'Tot sum', 'Tot size',
-                'Variance', 'Number', 'ARP', 'TCP', 'UDP', 'ICMP', 'IGMP',
-                'HTTP', 'HTTPS', 'DNS', 'SSH', 'DHCP',
-                'syn_flag_number', 'ack_flag_number', 'fin_flag_number',
-                'rst_flag_number', 'psh_flag_number',
-                'ece_flag_number', 'cwr_flag_number', 'Protocol Type', 'Time_To_Live']:
-        if col in X.columns:
-            X[col] = X[col].astype(np.int64)
-    return X
+    X_sample = X_scenario.loc[sample_idx]
+    y_sample = y_test.loc[sample_idx]
+    pred_sample = tree_model.predict(X_sample)
 
-X_test_int = quantize(X_test)
+    vectors_filename = f"flow_test_vectors{file_suffix}.csv"
+    vectors_path = os.path.join(OUT_DIR, vectors_filename)
+    X_sample_out = X_sample.copy()
+    X_sample_out['true_label']  = y_sample.values
+    X_sample_out['python_pred'] = pred_sample
+    X_sample_out.to_csv(vectors_path, index=False)
+    print(f"[3/5] Generated: {vectors_path}  ({len(X_sample_out)} rows, "
+          f"{(pred_sample==0).sum()} benign, {(pred_sample==1).sum()} attack predictions)")
 
-# Build FE features for S4
-FE_FEATURES_NEEDED = FE_FEATURES
+    # ── 4. Test harness ────────────────────────────────────────────────────
+    header_feat_list = repr(HEADER_FIELDS)
+    harness_filename = f"test_harness{file_suffix}.py"
+    results_csv_name = f"p4_validation_results{file_suffix}.csv"
 
-def build_fe(X):
-    # Mirrors build_engineered_features(..., integer_mode=True) plus the
-    # caller-side sentinel fillna in rebuild_integer_features(), both in
-    # 03_modeling.py, term for term -- so these test vectors are computed
-    # exactly the way the real model was trained on.
-    fe = pd.DataFrame(index=X.index)
-    safe_rate = X['Rate'].replace(SMARTNIC_MAX_INT, np.nan)
-    fe['FE_burst_intensity']    = (safe_rate * X['Number']).fillna(
-                                      np.int64(SMARTNIC_MAX_INT) * X['Number']).astype(np.int64)
-    fe['FE_flow_duration']      = (X['Number'] // safe_rate.replace(0, np.nan)).fillna(0).astype(np.int64)
-    fe['FE_size_cv_proxy']      = (X['Variance'] // (X['AVG'] + 1)).astype(np.int64)
-    proto_cols_full = ['HTTP', 'HTTPS', 'DNS', 'SSH', 'DHCP', 'TCP', 'UDP', 'ARP', 'ICMP', 'IGMP']
-    proto_cols = [c for c in proto_cols_full if c in S2_reduced]
-    fe['FE_protocol_diversity'] = (X[proto_cols] > 0).sum(axis=1).astype(np.int64)
-    fe['FE_size_range']         = (X['Max'] - X['Min']).astype(np.int64)
-    fe['FE_payload_ratio']      = (((X['Tot size'] - X['Header_Length']) * INT_SCALE_RATIO)
-                                    // (X['Tot size'] + 1)).astype(np.int64)
-    fe['FE_header_ratio']       = ((X['Header_Length'] * 100) // (X['Tot size'] + 1)).astype(np.int64)
-    app_layer_cols_full = ['HTTP', 'HTTPS', 'DNS', 'SSH', 'DHCP']
-    app_cols = [c for c in app_layer_cols_full if c in S2_reduced]
-    fe['FE_no_app_layer']       = ((X[app_cols].sum(axis=1)) == 0).astype(np.int64)
-    fe['FE_avg_min_ratio']      = (X['AVG'] // (X['Min'] + 1)).astype(np.int64)
-    fe['FE_arp_rate']           = (X['ARP'] * safe_rate).fillna(
-                                      X['ARP'] * np.int64(SMARTNIC_MAX_INT)).astype(np.int64)
-    return fe
-
-FE_test = build_fe(X_test_int)
-
-# Assemble full S4 feature matrix
-X_s4 = pd.concat([X_test_int[RAW_FEATURES], FE_test[FE_FEATURES]], axis=1)[S4_TREE]
-
-# Get Python model predictions
-py_preds = tree_model.predict(X_s4)
-
-# Stratified sample
-ben_idx = X_s4.index[y_test.loc[X_s4.index] == 0]
-atk_idx = X_s4.index[y_test.loc[X_s4.index] == 1]
-rng = np.random.RandomState(RANDOM_STATE)
-if N_TEST_VECTORS is None:
-    sample_idx = X_s4.index  # full test set
-else:
-    n_each = N_TEST_VECTORS // 2
-    sample_idx = np.concatenate([
-        rng.choice(ben_idx, min(n_each, len(ben_idx)), replace=False),
-        rng.choice(atk_idx, min(n_each, len(atk_idx)), replace=False),
-    ])
-    rng.shuffle(sample_idx)
-
-X_sample = X_s4.loc[sample_idx]
-y_sample = y_test.loc[sample_idx]
-pred_sample = tree_model.predict(X_sample)
-
-vectors_path = os.path.join(OUT_DIR, 'flow_test_vectors.csv')
-X_sample_out = X_sample.copy()
-X_sample_out['true_label']     = y_sample.values
-X_sample_out['python_pred']    = pred_sample
-X_sample_out.to_csv(vectors_path, index=False)
-print(f"[3/5] Generated: {vectors_path}  ({len(X_sample_out)} rows, "
-      f"{(pred_sample==0).sum()} benign, {(pred_sample==1).sum()} attack predictions)")
-
-# ── 4. Generate test_harness.py ───────────────────────────────────────────────
-header_feat_list = repr(HEADER_FIELDS)
-fe_feat_list      = repr(FE_FEATURES)
-s4_tree_list      = repr(S4_TREE)
-
-harness = f"""\
+    harness = f"""\
 #!/usr/bin/env python3
 \"\"\"
-test_harness.py -- P4 validation test harness
+{harness_filename} -- P4 validation test harness for {scenario}
 Generated by 04_generate_p4.py
 
 PURPOSE
 -------
-For each row in flow_test_vectors.csv, crafts one Ethernet frame carrying
+For each row in {vectors_filename}, crafts one Ethernet frame carrying
 that row's feature values in the custom flow header, sends it through the
 running BMv2 switch, and reads back the verdict from the result header.
 Compares every P4 verdict against the Python model's prediction stored in
@@ -560,7 +575,7 @@ Python model.
 
 USAGE (inside the P4 VM, after simple_switch is running)
 -----
-  python3 test_harness.py [--vectors flow_test_vectors.csv]
+  python3 {harness_filename} [--vectors {vectors_filename}]
                           [--iface veth0]
                           [--timeout 2.0]
 
@@ -579,19 +594,18 @@ try:
 except ImportError:
     sys.exit("scapy not found. Install with: pip install scapy")
 
-# ── Constants (must match arp_detector.p4) ────────────────────────────────────
-TYPE_FLOW   = 0x1234
-TYPE_RESULT = 0x1235
+# ── Constants (must match {p4_filename}) ────────────────────────────────────
+TYPE_FLOW   = {ethertype_flow:#06x}
+TYPE_RESULT = {ethertype_result:#06x}
 IFACE_DEFAULT = "veth0"
 TIMEOUT_DEFAULT = 2.0   # seconds to wait for reflected packet
 
-# Feature order in the custom header: 16 raw features + the 2 FE_*
-# features the tree actually uses, all precomputed, 64-bit each.
+# Feature order in the custom header, all precomputed, 64-bit each.
 HEADER_FIELDS = {header_feat_list}
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
-parser = argparse.ArgumentParser(description="P4 ARP detector test harness")
-parser.add_argument('--vectors',  default='flow_test_vectors.csv')
+parser = argparse.ArgumentParser(description="P4 ARP detector test harness ({scenario})")
+parser.add_argument('--vectors',  default='{vectors_filename}')
 parser.add_argument('--iface',    default=IFACE_DEFAULT)
 parser.add_argument('--timeout',  type=float, default=TIMEOUT_DEFAULT)
 parser.add_argument('--max-rows', type=int,   default=None,
@@ -608,7 +622,7 @@ print(f"Sending on interface: {{args.iface}}")
 # ── Build a custom flow header from one row ───────────────────────────────────
 def build_flow_header(row):
     \"\"\"Pack feature values into 8-byte big-endian fields, in HEADER_FIELDS
-    order (matches the bit<64> fields in flow_t in arp_detector.p4).\"\"\"
+    order (matches the bit<64> fields in flow_t in {p4_filename}).\"\"\"
     fields = []
     for feat in HEADER_FIELDS:
         val = int(row.get(feat, 0))
@@ -649,7 +663,7 @@ def send_and_receive(flow_payload, iface, timeout):
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 print("\\n" + "=" * 60)
-print("P4 VALIDATION -- sending test flows")
+print("P4 VALIDATION ({scenario}) -- sending test flows")
 print("=" * 60)
 
 results = []
@@ -682,7 +696,7 @@ for i, row in df.iterrows():
 # ── Summary ────────────────────────────────────────────────────────────────────
 total = len(results)
 print("\\n" + "=" * 60)
-print(f"RESULTS  ({{total}} flows)")
+print(f"RESULTS ({scenario}, {{total}} flows)")
 print("=" * 60)
 print(f"  Match    : {{n_match:>6}} / {{total}}  ({{n_match/total*100:.2f}}%)")
 print(f"  Mismatch : {{n_miss:>6}} / {{total}}")
@@ -706,26 +720,26 @@ else:
 
 # Save results
 out_df = pd.DataFrame(results)
-out_df.to_csv('p4_validation_results.csv', index=False)
-print(f"\\n  Full results saved -> p4_validation_results.csv")
+out_df.to_csv('{results_csv_name}', index=False)
+print(f"\\n  Full results saved -> {results_csv_name}")
 """
 
-harness_path = os.path.join(OUT_DIR, 'test_harness.py')
-with open(harness_path, 'w', encoding='utf-8') as f:
-    f.write(harness)
-print(f"[4/5] Generated: {harness_path}")
+    harness_path = os.path.join(OUT_DIR, harness_filename)
+    with open(harness_path, 'w', encoding='utf-8') as f:
+        f.write(harness)
+    print(f"[4/5] Generated: {harness_path}")
 
-# ── 5. Generate README.md ──────────────────────────────────────────────────────
-feature_header_size = len(HEADER_FIELDS) * 8  # 8 bytes per field (bit<64>)
+    # ── 5. README ──────────────────────────────────────────────────────────
+    readme_filename = "README.md" if not file_suffix else f"README{file_suffix}.md"
 
-readme = f"""\
-# P4 Validation -- ARP Spoofing Detector
+    readme = f"""\
+# P4 Validation -- {scenario} Decision Tree
 
-Generated by `04_generate_p4.py` from the fitted S4 Decision Tree.
+Generated by `04_generate_p4.py` from the fitted {scenario} Decision Tree.
 
 ## What this validates
 
-The S4 Decision Tree (depth={tree_model.get_depth()}, integer-quantized) is re-expressed as a
+The {scenario} Decision Tree (depth={tree_model.get_depth()}, integer-quantized) is re-expressed as a
 P4_16 program and run on BMv2. Each test flow is sent as a crafted packet;
 the P4 program classifies it and reflects the verdict back. If every verdict
 matches the Python model's prediction on the same row, the P4 encoding is
@@ -735,10 +749,14 @@ faithful and the model is confirmed deployable on a programmable SmartNIC.
 
 | File | Purpose |
 |---|---|
-| `arp_detector.p4` | P4_16 program (compile and run on BMv2) |
-| `flow_test_vectors.csv` | {len(X_sample_out):,} test-set rows ({n_desc}) with Python predictions |
-| `test_harness.py` | Sends flows through BMv2 and compares verdicts |
-| `table_entries.txt` | BMv2 startup notes (no runtime entries needed) |
+| `{p4_filename}` | P4_16 program (compile and run on BMv2) |
+| `{vectors_filename}` | {len(X_sample_out):,} test-set rows ({n_desc}) with Python predictions |
+| `{harness_filename}` | Sends flows through BMv2 and compares verdicts |
+| `{entries_filename}` | BMv2 startup notes (no runtime entries needed) |
+
+Uses ethertype pair {ethertype_flow:#06x}/{ethertype_result:#06x}, distinct
+from the other scenario's, so the two validations can never be
+cross-confused if both sets of files are present on the same VM.
 
 ## Scale factors used
 
@@ -773,23 +791,23 @@ sudo ip link set veth1 up
 
 ```bash
 cd /home/p4/p4_validation
-p4c --target bmv2 --arch v1model --std p4-16 arp_detector.p4
+p4c --target bmv2 --arch v1model --std p4-16 {p4_filename}
 ```
 
-This produces `arp_detector.json`.
+This produces `arp_detector{file_suffix}.json`.
 
 ### 4. Start the BMv2 switch
 
 ```bash
 sudo simple_switch --interface 0@veth0 --interface 1@veth1 \\
-    arp_detector.json &
+    arp_detector{file_suffix}.json &
 ```
 
 Wait 2-3 seconds for it to start.
 
 ### 5. Run the test harness
 
-`flow_test_vectors.csv` covers {n_desc} ({len(X_sample_out):,} rows). The
+`{vectors_filename}` covers {n_desc} ({len(X_sample_out):,} rows). The
 harness sends one packet and blocks on a capture per row, sequentially --
 if you're running the full test set, expect this to take several hours,
 not minutes. Progress prints every 100 rows so you can confirm it's moving.
@@ -798,7 +816,7 @@ survives a dropped VM console session, and pass `--max-rows N` first to
 sanity-check on a small slice before committing to the full run.
 
 ```bash
-python3 test_harness.py --iface veth0 --vectors flow_test_vectors.csv
+python3 {harness_filename} --iface veth0 --vectors {vectors_filename}
 ```
 
 ### 6. Read the results
@@ -808,7 +826,7 @@ Expected output if the encoding is correct:
 RESULT: PERFECT MATCH -- P4 encoding is faithful to the Python model.
 ```
 
-Full per-row results are saved to `p4_validation_results.csv`.
+Full per-row results are saved to `{results_csv_name}`.
 
 ## Troubleshooting
 
@@ -816,7 +834,7 @@ Full per-row results are saved to `p4_validation_results.csv`.
 Try `ip link show` to list interfaces and pass the correct one with `--iface`.
 
 **Mismatches:** The P4 tree logic diverges from Python at specific rows.
-Check the mismatch rows in `p4_validation_results.csv` -- compare the
+Check the mismatch rows in `{results_csv_name}` -- compare the
 feature values against the tree structure printed by `04_generate_p4.py`
 to identify which branch is being taken incorrectly.
 
@@ -824,13 +842,102 @@ to identify which branch is being taken incorrectly.
 This program was generated for p4c 1.2.x with BMv2 simple_switch 1.15.x.
 """
 
-readme_path = os.path.join(OUT_DIR, 'README.md')
-with open(readme_path, 'w', encoding='utf-8') as f:
-    f.write(readme)
-print(f"[5/5] Generated: {readme_path}")
+    readme_path = os.path.join(OUT_DIR, readme_filename)
+    with open(readme_path, 'w', encoding='utf-8') as f:
+        f.write(readme)
+    print(f"[5/5] Generated: {readme_path}")
+
+    return {
+        'scenario': scenario,
+        'p4_path': p4_path,
+        'tree_depth': int(tree_model.get_depth()),
+        'node_count': int(t.node_count),
+        'header_fields': len(HEADER_FIELDS),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Generate S3 first (the scenario recommended as the operational default),
+# then S4 (the scenario with feature engineering).
+# ─────────────────────────────────────────────────────────────────────────────
+s3_info = generate_scenario_p4(
+    scenario='S3',
+    results_path=os.path.join(RESULTS_DIR, 'S3_results.pkl'),
+    model_path=os.path.join(MODELS_DIR, 'S3_Decision_Tree.joblib'),
+    file_suffix='_s3',
+    ethertype_flow=0x1236,
+    ethertype_result=0x1237,
+)
+
+s4_info = generate_scenario_p4(
+    scenario='S4',
+    results_path=os.path.join(RESULTS_DIR, 'S4_results.pkl'),
+    model_path=os.path.join(MODELS_DIR, 'S4_Decision_Tree.joblib'),
+    file_suffix='',
+    ethertype_flow=0x1234,
+    ethertype_result=0x1235,
+)
 
 print(f"\n{'='*70}")
 print(f"ALL FILES GENERATED -> {OUT_DIR}")
 print(f"{'='*70}")
 print(f"\n  Next step: copy the p4_validation/ folder to your P4 VM.")
-print(f"  Then follow README.md inside that folder.")
+print(f"  Then follow README_s3.md (S3) and README.md (S4) inside that folder.")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RESOURCE SUMMARY -- static analysis of both generated .p4 files: program
+# size, tables, actions, header width, and register count. None of this
+# requires compiling or running anything on BMv2, let alone physical
+# hardware -- it is a property of the generated source text itself.
+#
+# Registers are checked explicitly (via a `register<` search) rather than
+# assumed absent: the per-flow state footprint constraint (Section III)
+# rules out any feature needing per-source state, so zero registers here
+# is a design property made falsifiable, not merely asserted.
+# ─────────────────────────────────────────────────────────────────────────────
+print(f"\n{'='*70}")
+print("RESOURCE SUMMARY")
+print(f"{'='*70}")
+
+def analyze_p4_resources(path):
+    with open(path, encoding='utf-8') as f:
+        text = f.read()
+    header_fields = re.findall(r'bit<64>\s+\w+;', text)
+    tables   = re.findall(r'^\s*table\s+(\w+)\s*\{', text, re.MULTILINE)
+    actions  = re.findall(r'^\s*action\s+(\w+)\s*\(', text, re.MULTILINE)
+    registers = re.findall(r'\bregister\s*<', text)
+    return {
+        'file': os.path.basename(path),
+        'lines': len(text.splitlines()),
+        'bytes': len(text.encode('utf-8')),
+        'header_fields': len(header_fields),
+        'header_bytes': len(header_fields) * 8,
+        'tables': len(tables),
+        'actions': len(actions),
+        'registers': len(registers),
+    }
+
+resource_summary = {
+    'S3': analyze_p4_resources(s3_info['p4_path']),
+    'S4': analyze_p4_resources(s4_info['p4_path']),
+}
+
+header = f"{'Metric':<22} {'S3':>14} {'S4':>14}"
+print(header)
+print("-" * len(header))
+rows = [
+    ('Program size (lines)', 'lines'),
+    ('Program size (bytes)', 'bytes'),
+    ('Tables',               'tables'),
+    ('Actions',               'actions'),
+    ('Header fields',         'header_fields'),
+    ('Header width (bytes)',  'header_bytes'),
+    ('Registers (stateful)',  'registers'),
+]
+for label, key in rows:
+    print(f"{label:<22} {resource_summary['S3'][key]:>14,} {resource_summary['S4'][key]:>14,}")
+
+resource_path = os.path.join(RESULTS_DIR, 'p4_resource_summary.json')
+with open(resource_path, 'w', encoding='utf-8') as f:
+    json.dump(resource_summary, f, indent=2)
+print(f"\nSaved: {resource_path}")
