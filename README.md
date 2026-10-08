@@ -1,8 +1,8 @@
 # Replication package
 
-Code for the ARP-spoofing-detection / SmartNIC-deployability pipeline used
+Code for the ARP-spoofing-detection / data plane-deployability pipeline used
 in the paper: data cleaning → EDA → train-only feature engineering and
-model training under SmartNIC hardware constraints (S1-S4 scenarios) →
+model training under data-plane hardware constraints (S1-S4 scenarios) →
 integer quantization → multi-seed stability check → P4/BMv2
 hardware-fidelity validation for the two deployable scenarios (S3, S4).
 
